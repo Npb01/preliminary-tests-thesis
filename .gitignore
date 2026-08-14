@@ -1,0 +1,19 @@
+# Bulk data -- copied by hand, never through git
+*.pt
+*.zip
+BPIC19.csv
+BPIC17_no_loop.csv
+bpic17_with_loops.csv
+*_initial.csv
+*_mapped.csv
+
+# Environment and caches
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Cluster job noise
+logs/
+gpu_util_*.log
+slurm-*.out
