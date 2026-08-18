@@ -57,6 +57,15 @@ REQUIRED_NEW_KEYS = [
     "mae_ttne_sum_CB_raw", "frac_neg_ttne_step_preds", "frac_neg_rrt_preds",
 ]
 
+# Additionally required, but only for logs that actually have an outcome head --
+# these keys can never appear for BPIC_19, so requiring them unconditionally
+# would mark every BPIC_19 run as permanently un-backfilled and re-run it on
+# every invocation.
+REQUIRED_OUTCOME_KEYS = [
+    "outcome_head_accuracy_CB", "outcome_suffix_accuracy_CB",
+    "outcome_disagreement_rate_CB",
+]
+
 # Must match the architecture hardcoded in TRAIN_EVAL_EQUAL_WEIGHTING.train_eval.
 D_MODEL = 32
 NUM_PREFIX_ENCODER_LAYERS = 4
@@ -95,12 +104,15 @@ def find_run_dirs(log_name, name_filter=None):
                 break
 
 
-def already_backfilled(results_path):
+def already_backfilled(results_path, log_name=None):
     diag_path = os.path.join(results_path, "consistency_diagnostics.pkl")
     if not os.path.isfile(diag_path):
         return False
     diagnostics = load_pickle(diag_path)
-    return all(k in diagnostics for k in REQUIRED_NEW_KEYS)
+    required = list(REQUIRED_NEW_KEYS)
+    if log_name is not None and log_configs.outcome_determining_activities_dict.get(log_name):
+        required += REQUIRED_OUTCOME_KEYS
+    return all(k in diagnostics for k in required)
 
 
 def backfill_run(run_name, backup_path, results_path, log_name, device):
@@ -117,6 +129,18 @@ def backfill_run(run_name, backup_path, results_path, log_name, device):
 
     bin_outbool = (out_type == "binary_outcome")
     multic_outbool = (out_type == "multiclass_outcome")
+
+    # Axiom-2 outcome diagnostics: resolve the determining activity NAMES from
+    # log_configs into the integer ids used in the tensors (`categ_mapping + 1`).
+    # Stays None for logs without an outcome head, which switches the block off
+    # inside inference_loop -- that default is what keeps BPIC_19 unaffected.
+    outcome_determining_ids = None
+    _det_names = log_configs.outcome_determining_activities_dict.get(log_name)
+    if outcome_bool and _det_names:
+        from outcome_consistency_metrics import resolve_determining_ids
+        _categ_mapping = load_pickle(
+            os.path.join(data_path, log_name + "_categ_mapping.pkl"))["concept:name"]
+        outcome_determining_ids, _ = resolve_determining_ids(_categ_mapping, _det_names)
 
     # --- Metadata / standardization stats (same as train_eval) ---
     cardinality_dict = load_pickle(os.path.join(data_path, log_name + "_cardin_dict.pkl"))
@@ -203,6 +227,7 @@ def backfill_run(run_name, backup_path, results_path, log_name, device):
         instance_mask_out=instance_mask_out_test,
         results_path=results_path,
         val_batch_size=TEST_BATCH_SIZE,
+        outcome_determining_ids=outcome_determining_ids,
     )
 
     # --- Integrity check: recomputed RRT MAE must match what's already stored ---
@@ -264,7 +289,7 @@ def main():
 
     todo, skipped = [], []
     for run_name, backup_path, results_path in runs:
-        if not args.force and already_backfilled(results_path):
+        if not args.force and already_backfilled(results_path, args.log_name):
             skipped.append(run_name)
         else:
             todo.append((run_name, backup_path, results_path))

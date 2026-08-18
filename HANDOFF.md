@@ -239,6 +239,15 @@ best-available · `07` do-no-harm audit · **`08` control comparison (key slide)
    them — `gradnorm`, `uw`, `uw_plus` and `pcgrad` are each missing all eight and
    raise `TypeError` on entry. It fails loudly, so nothing is silently corrupted,
    but the dispatcher is single-technique today. Must be fixed before §8.9.
+9. **Parallel jobs make pitfall 2 far more dangerous.** Two array tasks that
+   resolve to the same `model_string` will write to the same output directory
+   *simultaneously* and corrupt each other, with no error. Before the first array
+   submission, make the run directory collision-proof (assert it does not already
+   exist, or include the Slurm job id). Related: Slurm snapshots the batch script
+   at `sbatch` time but reads **data files at launch**, so editing code or data
+   while an array is still pending silently mixes versions across one batch —
+   which is exactly what the provenance block (commit hash + dirty count) written
+   by the job script exists to expose.
 
 ---
 
@@ -416,13 +425,115 @@ Report these; they justify the seed budget.
 
 ## 9. Environment
 
-Windows / PowerShell, `uv` for deps, CUDA torch (`torch==2.5.1+cu118`) installed
-from a separate index. `ltntorch==1.0.2`. Entry point is
-`python -m TRAIN_EVAL_FUNCTIONALITY.run_mto_experiment`; `main.py` is an unused
-cookiecutter stub. ~2.5–3h per BPIC_19 run; BPIC_17_DR is slower (window 46).
-Test-set inference alone is ~17 min regardless of epoch count, so even a 2-epoch
-smoke test takes ~20 min.
+### 9.1 Software (both machines)
 
-Checkpoints for all 40 epochs are retained per run (~7.8 GB for BPIC_19), which
-is what makes `backfill_diagnostics.py` possible — new metrics can be added
-without retraining.
+`uv` for deps (`uv sync` — `pyproject.toml` pins `torch==2.5.1+cu118` to a
+dedicated index, so do **not** install torch separately). `ltntorch==1.0.2`.
+Entry point is `python -m TRAIN_EVAL_FUNCTIONALITY.run_mto_experiment`;
+`main.py` is an unused cookiecutter stub.
+
+Local machine is Windows; the cluster is Linux, so use **Git Bash** locally for
+anything involving `ssh`/`scp`/heredocs, and keep `git config core.autocrlf
+input` set — a CRLF shell script fails on the cluster with `bad interpreter`.
+
+### 9.2 TU/e Umbrella cluster (added 2026-08-15)
+
+Slurm on Rocky Linux 8, access via `hpc.tue.nl` (VPN required off campus).
+No per-user job limits worth planning around: `MaxJobs` unset,
+`MaxSubmitJobs=10000`, **`MaxTime = 5 days` on every partition** — so no
+checkpoint-resume machinery is needed. `DefaultTime` is only 2 h, so
+**always pass `--time` explicitly** or the job is killed at two hours.
+
+| Partition | Hardware | Notes |
+|---|---|---|
+| `tue.gpu1.q` | 8× A30 MIG `1g.6gb` | **Production target** — small slices, but the least contended |
+| `tue.gpu2.q` | 4× L4 (24 GB) | 2.5× a MIG slice |
+| `tue.gpu3.q` | 8× L4 (24 GB) | same |
+| `tue.cpu1–3.q` | 64–96-core EPYC, 384–773 GB | preprocessing, analysis, BPIC_17 OG tensor generation |
+
+Storage: `$HOME` 200 GB / 1M inodes; `/scratch-shared/$USER` 8 TB / 3M inodes.
+Code and datasets live on scratch; **results are <1 MB per run and are versioned
+in git**, which is the only off-site copy. Checkpoints (116 MB/run) stay on
+scratch and are the one thing genuinely lost to a scratch purge — losing them
+costs the `backfill_diagnostics.py` capability, not the results.
+
+Billing weights are `CPU=1.0, Mem=0.25/GB, GPU=8.0`, so padding CPU/memory
+requests burns fair-share disproportionately. Measured `MaxRSS` is ~4.0 GB, so
+`--mem=8G` and `--cpus-per-task=4` are appropriate.
+
+### 9.3 Measured run costs
+
+`subset_fraction=0.5`, `val_subset_fraction=0.5`, BPIC_17_DR (window 46).
+
+| | Full epoch | Training loop | Remainder (val + ckpt) |
+|---|---|---|---|
+| Local Quadro P1000 (4 GB) | 14.5 min | not measured | not measured |
+| A30 MIG `1g.6gb` | **5.62 min** | 1.68 min (13.33 it/s) | 3.93 min (**70%**) |
+| L4 | **2.27 min** | 0.64 min (35.09 it/s) | 1.63 min (**72%**) |
+
+**The single most useful fact for planning: ~70% of an epoch is validation,
+not training.** Both scale with the GPU at about the same rate.
+
+Derived per-run and campaign costs (see §9.4 for how far to trust these):
+
+| | per 40-epoch run | 27 runs ÷ 7 MIG slices |
+|---|---|---|
+| MIG, subset 0.5 | ~4.0 h | ~15 h |
+| L4, subset 0.5 | ~1.7 h | — (contended) |
+| MIG, full data, ~100 epochs | ~12.5 h | ~2 days |
+
+**Scale by concurrency, not by hardware.** An L4 has roughly 20× a MIG slice's
+nominal FP32 throughput and delivers 2.5×, so the model is not compute-bound —
+a 240k-parameter model at batch 128 cannot saturate a modern GPU. Seven free MIG
+slices (1.75 runs/h) beat the L4 partitions, which were 12/12 busy both times
+they were checked; matching MIG throughput would need 3 concurrent L4s.
+**Chasing department-specific nodes is therefore not worth the effort.**
+
+Checkpoints are retained for every epoch — **2.88 MB each, 116 MB per 40-epoch
+BPIC_17_DR run** — which is what makes `backfill_diagnostics.py` possible.
+
+Keep every run in a comparison family on **one partition**: different GPU
+architectures can produce different floating-point results, and the effects
+under study are 1–2%.
+
+### 9.4 Limitations of the measurements in §9.3
+
+Stated plainly so nobody over-trusts them later:
+
+- **The P1000 figure is not a controlled measurement.** 14.5 min/epoch was
+  derived from checkpoint file mtimes across one local run — it therefore
+  includes any pauses, thermal throttling, and whatever else the laptop was
+  doing. Its train/validation split was never measured, so the P1000 column
+  above is deliberately blank rather than estimated. **Any laptop-vs-cluster
+  speedup ratio is approximate.** An earlier draft of this file quoted an "8.6×
+  training-loop speedup", which was circular — it assumed the whole laptop epoch
+  was training. Withdrawn.
+- **Cluster epoch times are n=1**, from the mtime gap between `model_epoch_0.pt`
+  and `model_epoch_1.pt` of a single 2-epoch job per GPU type. No repeats, no
+  variance estimate. Co-tenants on the same node share memory bandwidth and I/O,
+  so run-to-run variation is expected and unquantified.
+- **The train/validation split is a subtraction**, not a direct timing. "Remainder"
+  = full epoch − training loop, and lumps validation, checkpoint writing and
+  per-epoch overhead together.
+- **Test-inference cost is also a subtraction** (total − 2 epochs), and includes
+  data loading.
+- **40-epoch and full-data projections are linear extrapolations from 2 epochs.**
+  The full-data figure additionally assumes `subset_fraction` scales training
+  only, with validation fixed by `val_subset_fraction` — plausible from the
+  parameter names but **not verified**. Confirm on the first full-scale run.
+- **GPU spec ratios (~20×) come from published datasheets, not from this
+  hardware.** The empirical 2.5× MIG→L4 ratio is measured; the "20× nominal" it
+  is compared against is not.
+- **`mean SM util: 63.0%` (L4) does not mean 63% of the GPU's capacity.**
+  `nvidia-smi dmon`'s `sm` column is the fraction of *time* at least one kernel
+  was resident, not the fraction of SMs used. A model launching many small
+  kernels can show high values while using a few percent of the device. Treat it
+  as "the GPU was idle 37% of the time", nothing more. (Note the first attempt
+  reported 0.0% because `dmon -o T` prepends a timestamp column and the parsing
+  read the GPU-index column instead — use `$3`, not `$2`.)
+- **The contention snapshot (7/8 MIG free, 0/12 L4 free) was taken twice, both
+  around 01:00 local time.** That is not a representative sample of cluster load;
+  daytime availability may differ substantially. Re-check with
+  `sinfo -O partition,gres,gresused` before sizing a campaign.
+- **Queue wait is unmeasured.** The L4 job pended on `(Resources)` for an
+  unrecorded period. Campaign wall-clock estimates above count compute only.

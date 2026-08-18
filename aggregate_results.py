@@ -45,6 +45,25 @@ METRIC_KEYS = [
     "error_correlation_IB_raw",
     # How often clamping actually applies.
     "frac_neg_ttne_step_preds", "frac_neg_rrt_preds",
+
+    # --- outcome head -------------------------------------------------------
+    # These have been written into averaged_results_*.pkl by every outcome-log
+    # run all along; they were simply never listed here, so `load_metrics` (which
+    # uses .get(k, None)) dropped them silently. HANDOFF §8.4 previously recorded
+    # the outcome head as "unmeasured" -- it was measured, just not surfaced.
+    # No rerun or backfill is needed for these.
+    "Multi-Class Accuracy", "Macro-F1", "Weighted-F1",
+    "Macro-Precision", "Macro-Recall", "CE",
+
+    # --- axiom 2: outcome vs activity-suffix consistency --------------------
+    # Requires re-inference (backfill_diagnostics.py): the implied outcome is
+    # derived from the DECODED suffix, which is not persisted.
+    "outcome_head_accuracy_IB", "outcome_head_accuracy_CB",
+    "outcome_suffix_accuracy_IB", "outcome_suffix_accuracy_CB",
+    "outcome_head_vs_suffix_agreement_IB",
+    "outcome_disagreement_rate_IB", "outcome_disagreement_rate_CB",
+    "outcome_head_macro_f1_IB", "outcome_suffix_macro_f1_IB",
+    "frac_suffix_no_determining_act", "num_outcome_instances_evaluated",
 ]
 
 SEED_PATTERN = re.compile(r"_seed_(\d+)$")

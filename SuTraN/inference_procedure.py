@@ -39,8 +39,9 @@ def inference_loop(model,
                    mean_std_rrt, 
                    og_caseint, 
                    instance_mask_out, 
-                   results_path=None, 
-                   val_batch_size=8192):
+                   results_path=None,
+                   val_batch_size=8192,
+                   outcome_determining_ids=None):
     """Inference loop, both for validation set and ultimate test set.
 
     Parameters
@@ -729,6 +730,59 @@ def inference_loop(model,
                 # NOTE: every value above is in SECONDS (mean_std_ttne / mean_std_rrt
                 # unstandardize to seconds, cf. MAE_ttne_seconds), unlike the primary
                 # "MAE RRT minutes" metric. Convert at display time.
+
+                # --- NEW: axiom-2 outcome / activity-suffix consistency ---
+                # Compares the two available routes to the case outcome: the
+                # outcome head, and the outcome IMPLIED by the decoded activity
+                # suffix (its last determining activity). Gates the axiom-2 study
+                # -- see HANDOFF §8.7 and `axioms.md`.
+                #
+                # NOTE: this sits inside the `remaining_runtime_head` branch purely
+                # because that is where the diagnostics dict is built. It has no
+                # logical dependence on the RRT head; hoist it if an outcome-only
+                # configuration is ever run. Harmless today since every log in
+                # log_configs uses the RRT head.
+                if outcome_bool and multic_outbool and outcome_determining_ids:
+                    from outcome_consistency_metrics import outcome_consistency_diagnostics
+
+                    # END token is the highest activity id (num_classes-1), derived
+                    # from the labels rather than hardcoded.
+                    end_tok = num_classes - 1
+
+                    # Row alignment, and the easiest thing to get wrong here:
+                    # `out_pred_global_subset` and `labels_global[-1]` are already
+                    # restricted to the non-leaky instances (see ~line 270), but
+                    # `suffix_acts_decoded_global` is NOT -- it still covers all
+                    # `num_prefs` rows. Applying `retain_bool_out` realigns them.
+                    # A mismatch here would silently compare row i of one tensor
+                    # against a different case in another, yielding plausible but
+                    # meaningless accuracies; `outcome_consistency_diagnostics`
+                    # therefore raises on differing row counts.
+                    #
+                    # The CB weights must also match the ones the existing outcome
+                    # metrics use (`weights_out`/`num_cases_out` when masking is
+                    # active), or the new numbers are not comparable to them.
+                    if out_mask:
+                        acts_for_outcome = suffix_acts_decoded_global[retain_bool_out]
+                        out_logits_eval = out_pred_global_subset
+                        w_eval, nc_eval = weights_out, num_cases_out
+                    else:
+                        acts_for_outcome = suffix_acts_decoded_global
+                        out_logits_eval = out_pred_global
+                        w_eval, nc_eval = weights, num_cases
+
+                    consistency_diagnostics.update(
+                        outcome_consistency_diagnostics(
+                            act_suffix=acts_for_outcome,
+                            outcome_logits=out_logits_eval,
+                            outcome_labels=labels_global[-1],
+                            determining_ids=outcome_determining_ids,
+                            end_token=end_tok,
+                            weights=w_eval,
+                            num_cases=nc_eval,
+                            corrected_avg_fn=compute_corrected_avg,
+                        )
+                    )
 
                 diagnostics_path = os.path.join(results_path, "consistency_diagnostics.pkl")
                 with open(diagnostics_path, "wb") as f:
