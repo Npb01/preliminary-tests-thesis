@@ -560,9 +560,32 @@ def train_eval(log_name,
     # Running final inference on test set 
     from SuTraN.inference_procedure import inference_loop
 
-    # Initializing directory for final test set results 
+    # Initializing directory for final test set results
     results_path = os.path.join(backup_path, "TEST_SET_RESULTS")
     os.makedirs(results_path, exist_ok=True)
+
+    # Axiom-2 outcome diagnostics: resolve the determining activity NAMES from
+    # log_configs into the tensor ids (`categ_mapping + 1`). Stays None for logs
+    # without an outcome head, which switches the block off inside inference_loop.
+    # Without this, a freshly trained run produces no outcome-consistency metrics
+    # and needs a separate ~20 min backfill afterwards.
+    from TRAIN_EVAL_FUNCTIONALITY import log_configs as _log_configs
+    outcome_determining_ids = None
+    _det_names = _log_configs.outcome_determining_activities_dict.get(log_name)
+    if outcome_bool and _det_names:
+        import pickle as _pickle
+        from outcome_consistency_metrics import resolve_determining_ids
+        with open(os.path.join(data_path, log_name + '_categ_mapping.pkl'), 'rb') as _f:
+            _categ_mapping = _pickle.load(_f)['concept:name']
+        outcome_determining_ids, _ = resolve_determining_ids(_categ_mapping, _det_names)
+        # Trace the parameter to its use site rather than trusting the signature:
+        # a dropped parameter here would silently produce runs missing the axiom-2
+        # metrics, which is exactly the failure mode of HANDOFF pitfall 5.1.
+        print(f"[axiom2] outcome-consistency diagnostics active: "
+              f"determining ids = {outcome_determining_ids}")
+    elif outcome_bool:
+        print(f"[axiom2] no determining activities configured for '{log_name}'; "
+              f"outcome-consistency diagnostics will NOT be written.")
 
 
     inf_results_IB, inf_results_CB, pref_suf_results = inference_loop(model=model, 
@@ -579,8 +602,9 @@ def train_eval(log_name,
                                                                       mean_std_rrt=mean_std_rrt, 
                                                                       og_caseint=og_caseint_test,
                                                                       instance_mask_out=instance_mask_out_test,
-                                                                      results_path=results_path, 
-                                                                      val_batch_size=2048)
+                                                                      results_path=results_path,
+                                                                      val_batch_size=2048,
+                                                                      outcome_determining_ids=outcome_determining_ids)
 
     #######################################################
     ###########   INSTANCE-BASED (IB) METRICS   ###########
