@@ -121,6 +121,8 @@ def train_eval(log_name,
                subset_fraction=1.0,
                lambda_ltn=0.0,
                detach_mode="none",  # "none", "ttne", or "rrt"
+               lambda_ltn_outcome=0.0,
+               detach_mode_outcome="none",  # "none", "act", or "outcome"
                balance_losses=False,
                scale_ttne=1.0,
                scale_rrt=1.0,
@@ -371,6 +373,14 @@ def train_eval(log_name,
         model_string += '_ltn_{}'.format(lambda_ltn)
     if lambda_ltn > 0.0 and detach_mode != "none":
         model_string += '_detach_{}'.format(detach_mode)
+    # Axiom 2 gets its OWN tags. Reusing '_ltn_'/'_detach_' would make the two
+    # axioms indistinguishable in a folder name, and the notebook's parser keys
+    # conditions off exactly those substrings (§5.2: ambiguous names are how runs
+    # silently overwrite each other).
+    if lambda_ltn_outcome > 0.0:
+        model_string += '_ltnout_{}'.format(lambda_ltn_outcome)
+        if detach_mode_outcome != "none":
+            model_string += '_detachout_{}'.format(detach_mode_outcome)
     if balance_losses:
         # Encode the scales, not just the flag: two balanced configs with
         # different scales are different experiments (e.g. upweighting BOTH time
@@ -466,6 +476,40 @@ def train_eval(log_name,
             detach_mode=detach_mode,
         ).to(device)
 
+    # --- axiom 2: outcome / activity-suffix consistency ---
+    # Needs the log's determining activities; `outcome_determining_ids` is
+    # resolved further down for the diagnostics, but the training module needs it
+    # here, so resolve once and reuse.
+    ltn_outcome_module = None
+    if lambda_ltn_outcome > 0.0:
+        if not outcome_bool or out_type != 'multiclass_outcome':
+            raise ValueError(
+                f"lambda_ltn_outcome={lambda_ltn_outcome} but log '{log_name}' has "
+                f"outcome_bool={outcome_bool}, out_type={out_type!r}. Axiom 2 needs "
+                "a multiclass outcome head."
+            )
+        import pickle as _pickle_train
+        from TRAIN_EVAL_FUNCTIONALITY import log_configs as _log_configs_train
+        _det_names_train = _log_configs_train.outcome_determining_activities_dict.get(log_name)
+        if not _det_names_train:
+            raise ValueError(
+                f"lambda_ltn_outcome={lambda_ltn_outcome} but no determining "
+                f"activities are configured for '{log_name}' in log_configs."
+            )
+        from ltn_outcome_consistency import OutcomeConsistencyLoss
+        from outcome_consistency_metrics import resolve_determining_ids as _resolve
+        with open(os.path.join(data_path, log_name + '_categ_mapping.pkl'), 'rb') as _f:
+            _cm_train = _pickle_train.load(_f)['concept:name']
+        _det_ids_train, _end_tok_train = _resolve(_cm_train, _det_names_train)
+        ltn_outcome_module = OutcomeConsistencyLoss(
+            determining_ids=_det_ids_train,
+            end_token=_end_tok_train,
+            num_outclasses=num_outclasses,
+            detach_mode=detach_mode_outcome,
+        ).to(device)
+        print(f"[axiom2] module built: ids={_det_ids_train} end_token={_end_tok_train} "
+              f"lambda={lambda_ltn_outcome} detach_mode={detach_mode_outcome!r}")
+
     train_model(model, 
                 optimizer, 
                 train_dataset, 
@@ -497,6 +541,8 @@ def train_eval(log_name,
                 lr_scheduler=lr_scheduler, 
                 ltn_consistency_module=ltn_consistency_module,
                 lambda_ltn=lambda_ltn,
+                ltn_outcome_module=ltn_outcome_module,
+                lambda_ltn_outcome=lambda_ltn_outcome,
                 balance_losses=balance_losses,
                 scale_ttne=scale_ttne,
                 scale_rrt=scale_rrt,
@@ -955,6 +1001,13 @@ if __name__ == "__main__":
                         help="Fraction of the dataset to use (between 0 and 1).")
     parser.add_argument("--lambda_ltn", type=float, required=False, default=0.0,
                         help="Weight of the LTN cross-task consistency loss term.")
+    parser.add_argument("--lambda_ltn_outcome", type=float, required=False, default=0.0,
+                        help="Weight of the axiom-2 outcome-consistency term (0.0 = off).")
+    parser.add_argument("--detach_mode_outcome", type=str, required=False, default="none",
+                        choices=["none", "act", "outcome"],
+                        help="Which side of axiom 2 receives gradient: 'none' (both), "
+                             "'act' (only the outcome head moves), 'outcome' (only the "
+                             "activity head moves).")
     parser.add_argument("--detach_mode", type=str, required=False, default="none",
                         choices=["none", "ttne", "rrt"],
                         help="Which side of the LTN consistency axiom to detach (freeze).")
@@ -992,6 +1045,8 @@ if __name__ == "__main__":
         subset_fraction=args.subset_fraction if args.subset_fraction is not None else 1.0,
         lambda_ltn=args.lambda_ltn if args.lambda_ltn is not None else 0.0,
         detach_mode=args.detach_mode,
+        lambda_ltn_outcome=args.lambda_ltn_outcome if args.lambda_ltn_outcome is not None else 0.0,
+        detach_mode_outcome=args.detach_mode_outcome,
         balance_losses=args.balance_losses,
         scale_ttne=args.scale_ttne,
         scale_rrt=args.scale_rrt,

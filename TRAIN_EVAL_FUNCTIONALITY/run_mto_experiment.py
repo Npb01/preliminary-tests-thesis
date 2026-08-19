@@ -54,6 +54,8 @@ def run_mto_experiment(log_name: str,
                        subset_fraction: float= 1.0,
                        lambda_ltn: float = 0.0,
                        detach_mode: str = "none",
+                       lambda_ltn_outcome: float = 0.0,
+                       detach_mode_outcome: str = "none",
                        balance_losses: bool = False,
                        scale_ttne: float = 1.0,
                        scale_rrt: float = 1.0,
@@ -122,6 +124,8 @@ def run_mto_experiment(log_name: str,
         "subset_fraction": subset_fraction,
         "lambda_ltn": lambda_ltn,
         "detach_mode": detach_mode,
+        "lambda_ltn_outcome": lambda_ltn_outcome,
+        "detach_mode_outcome": detach_mode_outcome,
         "balance_losses": balance_losses,
         "scale_ttne": scale_ttne,
         "scale_rrt": scale_rrt,
@@ -182,6 +186,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Which side of the LTN consistency axiom to detach (freeze)."
     )
     parser.add_argument(
+        "--lambda_ltn_outcome",
+        type=float,
+        required=False,
+        default=0.0,
+        help="Weight of the axiom-2 outcome-consistency term (0.0 = off).",
+    )
+    parser.add_argument(
+        "--detach_mode_outcome",
+        type=str,
+        required=False,
+        default="none",
+        choices=["none", "act", "outcome"],
+        help="Which side of axiom 2 receives gradient: 'none' (both), 'act' "
+             "(only the outcome head moves), 'outcome' (only the activity head moves)."
+    )
+    parser.add_argument(
         "--balance_losses",
         action="store_true",
         help="Apply static rescaling to equalize ttne/rrt loss magnitudes."
@@ -233,6 +253,8 @@ if __name__ == "__main__":
         subset_fraction=arguments.subset_fraction,
         lambda_ltn=arguments.lambda_ltn,
         detach_mode=arguments.detach_mode,
+        lambda_ltn_outcome=arguments.lambda_ltn_outcome,
+        detach_mode_outcome=arguments.detach_mode_outcome,
         balance_losses=arguments.balance_losses,
         scale_ttne=arguments.scale_ttne,
         scale_rrt=arguments.scale_rrt,

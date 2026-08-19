@@ -37,6 +37,8 @@ def train_epoch(model,
                 max_norm,
                 ltn_consistency_module=None,
                 lambda_ltn=0.0,
+                ltn_outcome_module=None,
+                lambda_ltn_outcome=0.0,
                 balance_losses=False,
                 scale_ttne=1.0,
                 scale_rrt=1.0,):
@@ -98,7 +100,10 @@ def train_epoch(model,
 
     # Tracking global loss over all prediction heads:
     running_loss_glb = []
-    running_loss_ltn = []  # NEW: tracks LTN consistency term, if active
+    running_loss_ltn = []      # axiom 1: time consistency (Sigma-ttne == rrt)
+    running_loss_ltn_out = []  # axiom 2: outcome consistency (suffix implies outcome)
+    running_ltn_out_residual = []
+    running_ltn_out_survival = []
     # Tracking loss of each prediction head separately: 
     running_loss_act = [] # Cross-Entropy
     running_loss_ttne = [] # MAE
@@ -231,7 +236,55 @@ def train_epoch(model,
             loss = loss + lambda_ltn * ltn_term
             running_loss_ltn.append(ltn_term.item())
 
-        # Compute gradients 
+        # --- NEW: axiom 2, outcome / activity-suffix consistency ---
+        # Independent of axiom 1: both can be active, though HANDOFF §8.7 says to
+        # characterise them separately first.
+        if ltn_outcome_module is not None:
+            # outputs = (act_logits, ttne, [rrt], [outcome]); labels = (ttne, rrt,
+            # act_labels, outcome) for the `both` configuration.
+            act_logits = outputs[0]                              # (B, W, C_act)
+            act_labels = labels[-2]                              # (B, W)
+            outcome_logits = outputs[-1]                         # (B, num_outclasses)
+
+            # The axiom is only valid where the prefix does not already reveal the
+            # outcome -- the same subset the outcome loss is computed on.
+            valid_mask = None
+            if instance_mask_out is not None:
+                valid_mask = ~instance_mask_out
+
+            ltn_out_term, _, ltn_out_diag = ltn_outcome_module(
+                act_logits=act_logits,
+                act_labels=act_labels,
+                outcome_logits=outcome_logits,
+                valid_mask=valid_mask,
+            )
+
+            loss = loss + lambda_ltn_outcome * ltn_out_term
+            running_loss_ltn_out.append(ltn_out_term.item())
+            if "mean_residual_mass" in ltn_out_diag:
+                running_ltn_out_residual.append(ltn_out_diag["mean_residual_mass"])
+                running_ltn_out_survival.append(ltn_out_diag["min_survival"])
+
+            # Trace the parameter to its USE SITE, not just its arrival (§5.1: a
+            # dropped parameter has silently invalidated a whole wave of runs
+            # twice already). Checked once, so it costs nothing.
+            if num_batches_processed == 1 and epoch_number == 0:
+                if lambda_ltn_outcome == 0.0:
+                    raise ValueError(
+                        "ltn_outcome_module is active but lambda_ltn_outcome=0.0, "
+                        "so the axiom-2 term cannot affect the loss while the run "
+                        "would still be labelled as an axiom-2 run. Pass a real "
+                        "lambda, or leave the module as None."
+                    )
+                print(f"[axiom2] active: term={ltn_out_term.item():.6f} "
+                      f"lambda={lambda_ltn_outcome} "
+                      f"contribution={lambda_ltn_outcome * ltn_out_term.item():.6f} "
+                      f"of total loss {loss.item():.6f} "
+                      f"| residual_mass={ltn_out_diag.get('mean_residual_mass', float('nan')):.4f} "
+                      f"min_survival={ltn_out_diag.get('min_survival', float('nan')):.4g} "
+                      f"n={ltn_out_diag.get('num_instances', 0):.0f}")
+
+        # Compute gradients
         loss.backward()
 
         # Keep track of original gradient norm 
@@ -352,10 +405,37 @@ def train_epoch(model,
     elif both_not:
         epoch_averages = average_global_loss_epoch, average_global_loss_act, average_global_loss_ttne, loss
             
-    if out_mask: 
+    if out_mask:
         print("Number of batches skipped due to no valid outcome instances: {}".format(num_batches_skipped))
-    
-    return model, optimizer, epoch_averages    
+
+    # Axiom terms returned separately rather than appended to `epoch_averages`,
+    # whose layout is positional and differs per head configuration (and whose
+    # last element train_model reads as `last_loss`).
+    #
+    # Both `_term` values are 1 - sat, so satisfaction is 1 - term. `_contrib` is
+    # what actually enters the total loss, which is the number to look at when
+    # choosing lambda: it says what share of the objective the axiom commands.
+    def _mean(xs):
+        return (sum(xs) / len(xs)) if xs else float("nan")
+
+    ltn_epoch_averages = {
+        "ltn_ax1_term": _mean(running_loss_ltn),
+        "ltn_ax1_contrib": lambda_ltn * _mean(running_loss_ltn) if running_loss_ltn else float("nan"),
+        "ltn_ax2_term": _mean(running_loss_ltn_out),
+        "ltn_ax2_contrib": lambda_ltn_outcome * _mean(running_loss_ltn_out) if running_loss_ltn_out else float("nan"),
+        "ltn_ax2_residual_mass": _mean(running_ltn_out_residual),
+        "ltn_ax2_min_survival": min(running_ltn_out_survival) if running_ltn_out_survival else float("nan"),
+    }
+    if running_loss_ltn:
+        print("Axiom 1 term this epoch: {:.6f}  (sat {:.6f}, contributes {:.6f})".format(
+            ltn_epoch_averages["ltn_ax1_term"], 1 - ltn_epoch_averages["ltn_ax1_term"],
+            ltn_epoch_averages["ltn_ax1_contrib"]))
+    if running_loss_ltn_out:
+        print("Axiom 2 term this epoch: {:.6f}  (sat {:.6f}, contributes {:.6f})".format(
+            ltn_epoch_averages["ltn_ax2_term"], 1 - ltn_epoch_averages["ltn_ax2_term"],
+            ltn_epoch_averages["ltn_ax2_contrib"]))
+
+    return model, optimizer, epoch_averages, ltn_epoch_averages
 
             
 def train_model(model, 
@@ -399,6 +479,8 @@ def train_model(model,
                 max_norm = 2.,
                 ltn_consistency_module=None,
                 lambda_ltn=0.0,
+                ltn_outcome_module=None,
+                lambda_ltn_outcome=0.0,
                 balance_losses=False,
                 scale_ttne=1.0,
                 scale_rrt=1.0, 
@@ -729,6 +811,10 @@ def train_model(model,
     train_losses_global = []
     train_losses_act = []
     train_losses_ttne = []
+    # Per-epoch axiom terms and their weighted contributions to the total loss.
+    # Keyed dict rather than parallel lists so adding an axiom needs no changes
+    # here; every key present becomes a column in backup_results.csv.
+    ltn_losses_global = {}
 
     # Track evolution of validation metrics over the epoch loop by initializing empty lists. 
     avg_MAE_ttne_stand_glob, avg_MAE_ttne_minutes_glob, avg_dam_lev_glob = ([] for _ in range(3))
@@ -802,7 +888,7 @@ def train_model(model,
         model.train(True)
 
         # Process current epoch
-        model, optimizer, epoch_averages = train_epoch(model, 
+        model, optimizer, epoch_averages, ltn_epoch_averages = train_epoch(model,
                                                           train_dataloader, 
                                                           remaining_runtime_head,
                                                           outcome_bool, 
@@ -823,7 +909,11 @@ def train_model(model,
                                                           # '_balanced' -- but never reached the loss).
                                                           balance_losses=balance_losses,
                                                           scale_ttne=scale_ttne,
-                                                          scale_rrt=scale_rrt)
+                                                          scale_rrt=scale_rrt,
+                                                          ltn_outcome_module=ltn_outcome_module,
+                                                          lambda_ltn_outcome=lambda_ltn_outcome)
+        for _k, _v in ltn_epoch_averages.items():
+            ltn_losses_global.setdefault(_k, []).append(_v)
         train_losses_global.append(epoch_averages[0])
         train_losses_act.append(epoch_averages[1])
         train_losses_ttne.append(epoch_averages[2])
@@ -1110,5 +1200,14 @@ def train_model(model,
         results['Multi-Class Outcome - Weighted-Precision'] = weighted_precision_glob
         results['Multi-Class Outcome - Macro-Recall'] = macro_recall_glob
         results['Multi-Class Outcome - Weighted-Recall'] = weighted_recall_glob
+
+    # Axiom terms, one column per key, only for axioms that were actually active
+    # (an inactive axiom yields all-NaN and is dropped). `*_term` is 1 - sat;
+    # `*_contrib` is lambda * term, i.e. the share of the total loss the axiom
+    # commands -- the number to read when choosing lambda for a new log or axiom,
+    # since lambda does not transfer (HANDOFF §2.4).
+    for _key, _series in ltn_losses_global.items():
+        if any(v == v for v in _series):        # any non-NaN
+            results[_key] = _series
 
     results.to_csv(results_path, index=False)
