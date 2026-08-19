@@ -147,6 +147,9 @@ scratch; nothing from §2.1 carries over.
 | `run_phase2_seeds.py` | Wave-4 tiered seed expansion; tier 5 = BPIC_17_DR |
 | `run_phase3.py` | Wave-5 λ=1.5 + RRT-only upweight control |
 | `backfill_diagnostics.py` | Re-runs **inference only** from saved checkpoints to add new metrics to old runs. Resumable, `--dry_run`/`--filter`/`--force`. Verifies recomputed RRT MAE matches the stored value before trusting output. ~17 min/run. |
+| `outcome_consistency_metrics.py` | Axiom-2 metrics as pure tensor functions (no model/loop state, so unit-testable without a GPU): implied outcome from a decoded suffix, head-vs-suffix accuracy / macro-F1 / disagreement, and name→id resolution. Called from `inference_procedure`'s diagnostics block |
+| `test_outcome_consistency_metrics.py` | Synthetic cases (incl. accept-then-cancel, and a determining act after the END token) plus a ground-truth check that reproduces the exact 1.000000 of §8.7 |
+| `run_configs/bpic17dr_axiom1_sweep.py` | Config list for the BPIC_17_DR λ × detach sweep; run with no args to list all 26 and check for name clashes, with an index to run one. `run_bpic17dr_axiom1_sweep.sh` is a thin Slurm-array wrapper holding only the `#SBATCH` settings |
 | `multiple_comparisons.py` | Declares the family of reported tests explicitly, recomputes each from per-seed results, applies Bonferroni / Holm / Benjamini-Hochberg under both paired and Welch tests. Writes `multiple_comparisons_<log>.csv`. See §8.6 |
 | `quarantine_inert_balanced.py` | Moves pre-fix `_balanced` folders (inert duplicates) to `BPIC_19/_quarantine_inert_balanced/` |
 | `ltn_presentation_notebook.ipynb` | The analysis. Parses λ/detach/scales from folder names, so new configs need no edits. Writes `figures/*.png`. **§9 loads BPIC_17_DR into its own frame via `load_log()`** — `tidy_df` stays BPIC_19, so both logs are readable side by side without re-running anything. |
@@ -248,6 +251,28 @@ best-available · `07` do-no-harm audit · **`08` control comparison (key slide)
    while an array is still pending silently mixes versions across one batch —
    which is exactly what the provenance block (commit hash + dirty count) written
    by the job script exists to expose.
+10. **Smoke-test and debug runs silently join a real config's seed group.**
+    Another variant of pitfall 2, and the easiest one to walk into. A throwaway
+    run gets the same `model_string` as a real config and differs only by seed —
+    and `aggregate_results.py` groups by config, treating seed as a repeat. The
+    junk run is therefore averaged into the real group with no error anywhere.
+
+    This nearly happened: the two 2-epoch cluster smoke tests wrote to
+    `SUTRAN_DA_results_subset_0.5_multiclass_outcome_seed_98` and `_seed_99` —
+    the *exact* BPIC_17_DR baseline config string. Left in place they would have
+    folded two barely-trained models into the baseline group, corrupting the
+    baseline mean and every percentage change computed against it, and would also
+    have added two spurious runs to `backfill_diagnostics.py`'s todo list.
+
+    Two habits that prevent it:
+    - Delete smoke-test output directories as soon as the timings are read. The
+      numbers belong in §9.3; the 2-epoch checkpoints are worthless.
+    - Better, give throwaway runs a `subset_fraction` that no real config uses
+      (e.g. 0.49). The config string then differs and grouping is impossible.
+
+    To detect it: run the sweep's config script with no arguments — it flags
+    ` ALREADY EXISTS` — or check the per-config run counts in the notebook's
+    coverage table (§6 there), where an unexpected seed is the giveaway.
 
 ---
 
@@ -303,9 +328,16 @@ Report these; they justify the seed budget.
      the naive definition is just summed bias ÷ mean suffix length
    - **error SD** (`err_rt.std()`, `err_ts.std()`) — would replace the currently
      *inferred* bias/variance decomposition with a measured one
-   - **outcome-head metrics** in `METRIC_KEYS` — BPIC_17_DR has a multiclass
-     outcome head that is currently unmeasured, so "no harm to other tasks"
-     is unverified on that log. **Now also gating for axiom 2 — see item 7.**
+   - ~~**outcome-head metrics** in `METRIC_KEYS`~~ — **DONE, and the premise was
+     wrong.** The outcome head was never unmeasured: `Multi-Class Accuracy`,
+     `Macro-F1`, `Weighted-F1`, `Macro-Precision`, `Macro-Recall` and `CE` have
+     been written into every outcome-log run's `averaged_results_*.pkl` all along.
+     They were simply absent from `METRIC_KEYS`, and `load_metrics` uses
+     `.get(k, None)`, so `aggregate_results.py` dropped them silently. Adding the
+     keys cost no GPU time. Result: **axiom 1 does no harm to the outcome head** —
+     accuracy 0.7862 / 0.7870 / 0.7867 at λ = 0 / 0.5 / 1.0, with the seeds not
+     even agreeing on sign at λ=1.0. A reminder that "unmeasured" should be
+     verified by opening the pickle, not inferred from the aggregation table.
 
 5. **Switch the n=6 comparisons to paired t-tests** (seeds are matched; ~5×
    more power, same conclusions).
@@ -388,13 +420,58 @@ Report these; they justify the seed budget.
    is better calibrated. New `detach_mode` values must not reuse `"ttne"`/`"rrt"`,
    or folder names become ambiguous (§5.2).
 
-   **Gating measurement, before any training run.** Outcome-head accuracy /
-   macro-F1 vs. the accuracy of the outcome *implied by the decoded suffix*, plus
-   their disagreement rate, on the 2 existing BPIC_17_DR baselines. Both
-   `suffix_acts_decoded_global` and `out_pred_global` already exist in memory at
-   `inference_procedure.py:396`, so this is a re-inference backfill, not training.
-   If the disagreement rate is tiny, or the decoded suffix is clearly the worse
-   estimator, that is the answer for ~2h instead of ~30 GPU-hours.
+   **Gating measurement — DONE (2026-08-15). The gate is passed.**
+   Backfilled all six BPIC_17_DR runs (~1.6 h on one MIG slice) to compare the two
+   available routes to the case outcome: the outcome head, and the outcome implied
+   by the *decoded* activity suffix. Test set, CB, seeds {3, 17}, n=2 per row:
+
+   | λ | Head acc | Suffix acc | Disagreement | Head macro-F1 | Suffix macro-F1 | No det. act |
+   |---|---|---|---|---|---|---|
+   | **0.0** | **0.7862** | **0.7700** | **0.0993** | 0.6553 | 0.6541 | 0.0012 |
+   | 0.5 | 0.7870 | 0.7801 | 0.0575 | 0.6535 | 0.6557 | 0.0010 |
+   | 1.0 | 0.7867 | 0.7729 | 0.0986 | 0.6543 | 0.6566 | 0.0008 |
+
+   (The two macro-F1 columns are IB and comparable to each other, but **not** to
+   the `Macro-F1` = 0.6906 stored in `averaged_results_CB.pkl`, which is CB.)
+
+   **The two routes are comparably accurate but fail on different cases.** The
+   suffix route is only 1.6 pp behind the head (0.7700 vs 0.7862) and level on
+   macro-F1 — yet the two **disagree on 9.9%** of instances. If the errors were
+   nested, disagreement could not exceed ~1.6 pp. Decomposing the baseline row,
+   the suffix route is right where the head is wrong on **up to 4.2%** of cases,
+   putting an oracle combination at **≤ 0.828**, roughly 4 pp above either alone.
+   That is real, exploitable headroom, and it is the most favourable of the four
+   outcomes that were written down before the measurement.
+
+   **A prediction that failed, and why it matters.** It was predicted beforehand
+   that the suffix route would be *substantially* worse, on the reasoning that the
+   implied outcome is a step function of activity order — one misplaced
+   `O_Cancelled` flips it, with none of the error cancellation that protects
+   axiom 1's sum. That mechanism is real but empirically small:
+   `frac_suffix_no_determining_act ≈ 0.001` shows the decoder nearly always emits
+   a determining activity, and usually the right one, despite DL-sim of only
+   0.774. **Do not assume a decoded-suffix quantity is unusable just because the
+   suffix metric looks mediocre** — DL-sim penalises every position, whereas this
+   axiom depends on one.
+
+   **Consequences for the design.**
+   - Proceed. Enough headroom, neither route degenerate, domain fully populated.
+   - **The three-arm design is now positively justified**, not just cautious. For
+     axiom 1 the §2.3 scope condition clearly favoured one direction because one
+     head was better calibrated; here neither route dominates, so there is no
+     a priori reason to prefer `detach="act"` over `detach="outcome"`, and
+     both-free is genuinely motivated. A single-direction start would probably
+     have picked wrong.
+   - **Formulation A's residual-mass risk is largely retired.** With
+     `frac_suffix_no_determining_act ≈ 0.001`, the soft `q(o)` carries almost no
+     mass on "no determining event". Still worth logging per epoch.
+
+   **Caveats.** n=2, so the λ column is not interpretable: the disagreement dip at
+   λ=0.5 (0.0575) and return at λ=1.0 (0.0986) is non-monotonic, and there is no
+   mechanism by which a *time*-consistency axiom would systematically change
+   outcome/suffix agreement. Treat as noise unless both seeds agree on sign.
+   Head accuracy is flat across λ (0.7862 → 0.7870 → 0.7867), which independently
+   confirms axiom 1 does no harm to the outcome head.
 
    **Biggest known risk** (full list at the end of `axioms.md`): both axioms are
    enforced under teacher forcing but evaluated on greedy decoding, and axiom 2's
