@@ -39,7 +39,7 @@ VAL_SUBSET_FRACTION = 0.5
 
 # Grid shifted DOWN from BPIC_19's: §2.4 predicts the useful range here is
 # ~0.2-0.3. lambda=1.0 is kept as a reproduction check of the P1000 result.
-SEEDS = [101, 102]
+SEEDS = [103, 104, 105] # did [101, 102] already
 LAMBDAS = [0.1, 0.25, 0.5, 1.0]
 DETACH_MODES = ["none", "ttne", "rrt"]   # both free / only RRT moves / only Sttne moves
 

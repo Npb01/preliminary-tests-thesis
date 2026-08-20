@@ -132,17 +132,36 @@ def load_metrics(pkl_path: str) -> dict:
     return metrics
 
 
-def aggregate(log_name: str, training_mode: str | None = None) -> pd.DataFrame:
+def aggregate(log_name: str, training_mode: str | None = None,
+              seeds: list[int] | None = None) -> pd.DataFrame:
+    """Collect every completed run under `log_name/` into a per-seed table and a
+    mean/std-over-seeds summary.
+
+    Parameters
+    ----------
+    seeds : list of int, optional
+        Restrict to these seeds. Needed whenever one config name exists on more
+        than one hardware generation: on BPIC_17_DR the baseline and the
+        `_ltn_{0.5,1.0}_detach_ttne` configs were run both locally (seeds 3, 17,
+        Quadro P1000) and on the cluster (seeds 101, 102, A30 MIG). Grouping is
+        by config with seed treated as a repeat, so without a filter those rows
+        silently average across GPU architectures -- and the effects under study
+        are 1-2% (HANDOFF §9.3). Pass the block belonging to one machine.
+    """
     rows = []
     for config_key, seed, pkl_path in find_run_dirs(log_name, training_mode):
+        if seeds is not None and seed not in seeds:
+            continue
         metrics = load_metrics(pkl_path)
         metrics["config"] = config_key
         metrics["seed"] = seed
         rows.append(metrics)
 
     if not rows:
+        seed_note = f" with seed in {seeds}" if seeds is not None else ""
         raise RuntimeError(
-            f"No '{RESULT_FILENAME}' found anywhere under '{log_name}/SUTRAN_DA_results*_seed_*/'. "
+            f"No '{RESULT_FILENAME}' found anywhere under "
+            f"'{log_name}/SUTRAN_DA_results*_seed_*/'{seed_note}. "
             "Check that at least one run has completed and that the log_name matches "
             "the folder actually produced by TRAIN_EVAL_EQUAL_WEIGHTING.py."
         )
@@ -190,11 +209,49 @@ if __name__ == "__main__":
             "the normal single-technique-per-run layout."
         ),
     )
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help=(
+            "Comma-separated seeds to restrict to, e.g. '101,102'. Use this when a "
+            "config name exists on more than one machine: BPIC_17_DR's baseline and "
+            "its _ltn_{0.5,1.0}_detach_ttne configs were run both locally (3,17) and "
+            "on the cluster (101,102), and without a filter the summary averages "
+            "across GPU architectures."
+        ),
+    )
     parser.add_argument("--out_csv", default=None, help="Optional path to save the raw per-seed table as CSV.")
     parser.add_argument("--out_summary_csv", default=None, help="Optional path to save the aggregated mean/std table as CSV.")
     args = parser.parse_args()
 
-    per_seed_df, grouped_df = aggregate(args.log_name, args.training_mode)
+    seed_filter = None
+    if args.seeds:
+        seed_filter = [int(s) for s in args.seeds.split(",") if s.strip()]
+        print(f"Restricting to seeds {seed_filter}.")
+
+    per_seed_df, grouped_df = aggregate(args.log_name, args.training_mode, seed_filter)
+
+    # Warn when a config spans several seeds that were never meant to be pooled.
+    # Cheap, and it makes the hazard visible instead of relying on the reader
+    # remembering which seeds came from which machine.
+    if seed_filter is None:
+        MACHINE_BLOCKS = {"local (P1000)": {3, 5, 17, 23, 31, 47}, "cluster (MIG)": {101, 102}}
+        # A hardcoded seed->machine map goes stale the moment a new seed is used,
+        # and a check that silently stops checking is worse than no check: it
+        # gives a green light that is not looking at anything. So announce any
+        # seed we cannot classify, rather than passing it over.
+        unclassified = set(per_seed_df["seed"]) - set().union(*MACHINE_BLOCKS.values())
+        if unclassified:
+            print(f"!! WARNING: seed(s) {sorted(unclassified)} are not listed in "
+                  f"MACHINE_BLOCKS, so cross-machine pooling CANNOT be detected for "
+                  f"them. Add them to MACHINE_BLOCKS in aggregate_results.py.")
+        for cfg, grp in per_seed_df.groupby("config"):
+            present = set(grp["seed"])
+            blocks = [name for name, block in MACHINE_BLOCKS.items() if present & block]
+            if len(blocks) > 1:
+                print(f"!! WARNING: config '{cfg}' pools seeds from {blocks} "
+                      f"({sorted(present)}). Different GPU architectures; pass "
+                      f"--seeds to separate them.")
 
     print("\n=== Per-seed results ===")
     print(per_seed_df.to_string(index=False))

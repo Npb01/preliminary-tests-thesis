@@ -4,8 +4,8 @@
 #SBATCH --gres=gpu:1g.6gb:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
-#SBATCH --time=16:00:00
-#SBATCH --array=0-25%6
+#SBATCH --time=8:00:00
+#SBATCH --array=0-38%6
 #SBATCH --output=/scratch-shared/%u/thesis/logs/%x-%A_%a.out
 #
 # Server settings only. The experiment configs live in
